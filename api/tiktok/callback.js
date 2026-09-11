@@ -1,6 +1,8 @@
 const REDIRECT_URI =
   "https://b-music02-backend.vercel.app/api/tiktok/callback";
 
+const TOKEN_KEY = "b_music02:tiktok_tokens";
+
 function getCookie(req, name) {
   const cookies = req.headers.cookie || "";
   const match = cookies
@@ -8,7 +10,35 @@ function getCookie(req, name) {
     .map(v => v.trim())
     .find(v => v.startsWith(name + "="));
 
-  return match ? decodeURIComponent(match.split("=").slice(1).join("=")) : null;
+  return match
+    ? decodeURIComponent(match.split("=").slice(1).join("="))
+    : null;
+}
+
+async function redis(command) {
+  const url = process.env.KV_REST_API_URL;
+  const token = process.env.KV_REST_API_TOKEN;
+
+  if (!url || !token) {
+    throw new Error("Redis bağlantı bilgileri bulunamadı.");
+  }
+
+  const response = await fetch(url, {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${token}`,
+      "Content-Type": "application/json"
+    },
+    body: JSON.stringify(command)
+  });
+
+  const data = await response.json();
+
+  if (!response.ok || data.error) {
+    throw new Error(data.error || "Redis işlemi başarısız.");
+  }
+
+  return data.result;
 }
 
 module.exports = async (req, res) => {
@@ -41,17 +71,10 @@ module.exports = async (req, res) => {
     const clientKey = process.env.TIKTOK_CLIENT_KEY;
     const clientSecret = process.env.TIKTOK_CLIENT_SECRET;
 
-    if (!clientKey || !clientSecret) {
-      return res.status(500).json({
-        ok: false,
-        message: "TikTok sunucu anahtarları bulunamadı."
-      });
-    }
-
     const tokenBody = new URLSearchParams({
       client_key: clientKey,
       client_secret: clientSecret,
-      code: code,
+      code,
       grant_type: "authorization_code",
       redirect_uri: REDIRECT_URI
     });
@@ -72,27 +95,28 @@ module.exports = async (req, res) => {
     if (!tokenResponse.ok || !tokenData.access_token) {
       return res.status(500).json({
         ok: false,
-        message: "TikTok erişim anahtarı alınamadı.",
-        error: tokenData.error || null,
-        error_description: tokenData.error_description || null
+        message: "TikTok erişim anahtarı alınamadı."
       });
     }
 
-    const videoResponse = await fetch(
-      "https://open.tiktokapis.com/v2/video/list/?fields=id,title,video_description,create_time,cover_image_url,share_url,embed_link",
-      {
-        method: "POST",
-        headers: {
-          Authorization: `Bearer ${tokenData.access_token}`,
-          "Content-Type": "application/json"
-        },
-        body: JSON.stringify({
-          max_count: 20
-        })
-      }
-    );
+    const now = Date.now();
 
-    const videoData = await videoResponse.json();
+    const storedTokens = {
+      access_token: tokenData.access_token,
+      refresh_token: tokenData.refresh_token,
+      open_id: tokenData.open_id,
+      scope: tokenData.scope,
+      access_expires_at:
+        now + Number(tokenData.expires_in || 0) * 1000,
+      refresh_expires_at:
+        now + Number(tokenData.refresh_expires_in || 0) * 1000
+    };
+
+    await redis([
+      "SET",
+      TOKEN_KEY,
+      JSON.stringify(storedTokens)
+    ]);
 
     res.setHeader(
       "Set-Cookie",
@@ -101,15 +125,13 @@ module.exports = async (req, res) => {
 
     return res.status(200).json({
       ok: true,
-      message: "B_music02 TikTok bağlantısı başarılı.",
-      video_count: videoData.data?.videos?.length || 0,
-      videos: videoData.data?.videos || [],
-      has_more: videoData.data?.has_more || false
+      message:
+        "B_music02 TikTok hesabı bağlandı ve bilgiler güvenli şekilde kaydedildi."
     });
   } catch (err) {
     return res.status(500).json({
       ok: false,
-      message: "Sunucu hatası oluştu."
+      message: err.message || "Sunucu hatası oluştu."
     });
   }
 };
